@@ -1,0 +1,56 @@
+tawkeed-cp/
+├─ README.md
+├─ LICENSE
+├─ CITATION.cff
+├─ .gitignore
+├─ CODEOWNERS
+├─ CONTRIBUTING.md
+├─ CODE_OF_CONDUCT.md
+├─ SECURITY.md
+├─ CHANGELOG.md
+├─ requirements.txt
+├─ environment.yml
+├─ pyproject.toml
+├─ setup.cfg
+├─ Makefile
+├─ .github/
+│  ├─ ISSUE_TEMPLATE/
+│  │  ├─ bug_report.yml
+│  │  └─ feature_request.yml
+│  ├─ PULL_REQUEST_TEMPLATE.md
+│  └─ workflows/
+│     ├─ ci.yml
+│     └─ docs.yml          # (we’ll use in Batch 4)
+├─ configs/
+│  ├─ default.yaml         # core pipeline settings
+│  ├─ risk_policy.yaml     # thresholds for R(x)
+│  └─ paths.yaml           # data/artifacts paths
+├─ data/
+│  ├─ raw/                 # place input CSVs here (not committed)
+│  ├─ interim/             # normalized/intermediate artifacts
+│  └─ processed/           # outputs for plots/tables/json
+├─ notebooks/
+│  ├─ README.md
+│  └─ colab_runbook.md     # step-by-step cells to paste to Colab
+├─ scripts/
+│  ├─ prepare_data.py
+│  ├─ train_calibrate.py
+│  ├─ eval_cp.py
+│  ├─ plot_results.py
+│  └─ export_section4.py   # generates Section 4 text & tables from artifacts
+├─ src/
+│  └─ tawkeed_cp/
+│     ├─ __init__.py
+│     ├─ io.py             # loading/saving CSV & artifacts
+│     ├─ normalize.py      # T3/I2 normalization
+│     ├─ risk.py           # T2/I2 risk features R(x)
+│     ├─ vec.py            # vectorizers (TF-IDF)
+│     ├─ split.py          # train/cal/test splits with stratification
+│     ├─ models.py         # LR baseline + temperature calibration
+│     ├─ cp.py             # split CP + Mondrian CP
+│     ├─ metrics.py        # ECE, Brier, confusion metrics
+│     ├─ plots.py          # coverage, ASS, by-band plots
+│     └─ utils.py          # helpers (rng seed, logging)
+└─ docs/
+   ├─ README.md
+   └─ mkdocs.yml           # Batch 4
