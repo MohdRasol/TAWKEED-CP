@@ -1,0 +1,565 @@
+__all__ = [
+    "io",
+    "normalize",
+    "risk",
+    "vec",
+    "models",
+    "cp",
+    "metrics",
+    "plots",
+    "utils",
+]
+import os
+import json
+import random
+import numpy as np
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def dump_json(obj, path: str):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def load_json(path: str):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def path_join(*args) -> str:
+    return os.path.join(*args)
+
+def write_markdown(path: str, text: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+import os
+import pandas as pd
+from .utils import ensure_dir, path_join
+
+def ensure_dirs(cfg: dict):
+    ensure_dir(cfg["paths"]["interim_dir"])
+    ensure_dir(cfg["paths"]["processed_dir"])
+
+def load_raw(cfg: dict):
+    en_path = cfg["paths"]["raw_en"]
+    ar_path = cfg["paths"]["raw_ar"]
+
+    dfe = pd.read_csv(en_path, encoding="latin-1")
+    # English UCI: columns v1(label), v2(text) OR label/text
+    if {"v1", "v2"}.issubset(dfe.columns):
+        dfe = dfe[["v1", "v2"]].rename(columns={"v1": "label", "v2": "text"})
+    else:
+        assert {"label", "text"}.issubset(dfe.columns), f"English CSV must have v1/v2 or label/text. Found: {dfe.columns.tolist()}"
+    dfe = dfe.dropna(subset=["text"]).copy()
+    dfe["text"] = dfe["text"].astype(str)
+    dfe["label"] = dfe["label"].map({"ham": "ham", "spam": "smish"})
+    assert set(dfe["label"].unique()).issubset({"ham","smish"}), "Unexpected English labels"
+    dfe["y"] = (dfe["label"] == "smish").astype(int)
+    dfe["language"] = "EN"
+
+    dfa = pd.read_csv(ar_path, encoding="utf-8")
+    if "message_ar" in dfa.columns and "label" in dfa.columns:
+        dfa = dfa.rename(columns={"message_ar": "text"})
+    else:
+        assert {"text", "label"}.issubset(dfa.columns), f"Arabic CSV must have message_ar/label OR text/label. Found: {dfa.columns.tolist()}"
+    dfa = dfa.dropna(subset=["text"]).copy()
+    dfa["text"] = dfa["text"].astype(str)
+    dfa["y"] = dfa["label"].astype(int)
+    dfa["label"] = dfa["y"].map({1: "smish", 0: "ham"})
+    assert set(dfa["label"].unique()).issubset({"ham","smish"}), "Unexpected Arabic labels"
+    dfa["language"] = "AR"
+
+    return dfe, dfa
+
+def save_interim(dfe: pd.DataFrame, dfa: pd.DataFrame, cfg: dict):
+    interim = cfg["paths"]["interim_dir"]
+    dfe.to_csv(path_join(interim, "english_with_risk.csv"), index=False)
+    dfa.to_csv(path_join(interim, "arabic_with_risk.csv"), index=False)
+
+def load_interim(cfg: dict):
+    interim = cfg["paths"]["interim_dir"]
+    dfe = pd.read_csv(path_join(interim, "english_with_risk.csv"))
+    dfa = pd.read_csv(path_join(interim, "arabic_with_risk.csv"))
+    return dfe, dfa
+
+def save_models(en_artifacts, ar_artifacts, cfg: dict):
+    from joblib import dump
+    processed = cfg["paths"]["processed_dir"]
+
+    (en_model, en_vecs) = en_artifacts
+    (ar_model, ar_vecs) = ar_artifacts
+
+    dump(en_model, path_join(processed, "en_model.joblib"))
+    dump(en_vecs, path_join(processed, "en_vecs.joblib"))
+    dump(ar_model, path_join(processed, "ar_model.joblib"))
+    dump(ar_vecs, path_join(processed, "ar_vecs.joblib"))
+
+def load_models_and_data(cfg: dict):
+    from joblib import load
+    dfe, dfa = load_interim(cfg)
+    processed = cfg["paths"]["processed_dir"]
+    en_model = load(path_join(processed, "en_model.joblib"))
+    en_vecs   = load(path_join(processed, "en_vecs.joblib"))
+    ar_model = load(path_join(processed, "ar_model.joblib"))
+    ar_vecs   = load(path_join(processed, "ar_vecs.joblib"))
+    return (dfe, dfa, (en_model, en_vecs), (ar_model, ar_vecs))
+
+def save_summaries(en_summary: dict, ar_summary: dict, cfg: dict):
+    from .utils import dump_json
+    processed = cfg["paths"]["processed_dir"]
+    dump_json(en_summary, path_join(processed, "summary_en.json"))
+    dump_json(ar_summary, path_join(processed, "summary_ar.json"))
+
+def load_summaries(cfg: dict):
+    from .utils import load_json, path_join
+    processed = cfg["paths"]["processed_dir"]
+    en_summary = load_json(path_join(processed, "summary_en.json"))
+    ar_summary = load_json(path_join(processed, "summary_ar.json"))
+    return en_summary, ar_summary
+import re
+import pandas as pd
+
+# Minimal, dependency-free normalization to match the Colab baseline.
+# Arabic deep normalization (diacritics/alif/yāʾ canonicalization) is simplified here.
+
+AR_DIACRITICS = "".join([
+    "\u064B", "\u064C", "\u064D", "\u064E", "\u064F", "\u0650", "\u0651", "\u0652",
+    "\u0610", "\u0611", "\u0612", "\u0613", "\u0614", "\u0615", "\u0656", "\u0657",
+    "\u0658", "\u0659", "\u065A", "\u065B", "\u065C", "\u065D", "\u065E", "\u065F",
+    "\u0670"
+])
+AR_DIACRITICS_RE = re.compile(f"[{AR_DIACRITICS}]")
+
+def _strip_arabic_diacritics(s: str) -> str:
+    return AR_DIACRITICS_RE.sub("", s)
+
+def _canonicalize_alif_ya(s: str) -> str:
+    # Normalize a few frequent variants
+    s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    s = s.replace("ى", "ي")
+    return s
+
+def apply_arabic(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["text"] = out["text"].astype(str).map(_strip_arabic_diacritics).map(_canonicalize_alif_ya)
+    return out
+
+def apply_english(df: pd.DataFrame) -> pd.DataFrame:
+    # Keep minimal: lowercasing + strip to preserve TF-IDF comparability (no external lemmatizer)
+    out = df.copy()
+    out["text"] = out["text"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    return out
+import re
+import pandas as pd
+
+ZW_CODES = {0x200B, 0x200C, 0x200D, 0x2060}
+
+def url_present(s: str) -> int:
+    return int(bool(re.search(r"(http[s]?://|www\.)", s, flags=re.IGNORECASE)))
+
+def count_digits_all_scripts(s: str) -> int:
+    latin = sum(ch.isdigit() for ch in s)
+    arabic_indic = sum(0x0660 <= ord(ch) <= 0x0669 for ch in s) + sum(0x06F0 <= ord(ch) <= 0x06F9 for ch in s)
+    return latin + arabic_indic
+
+def has_zero_width(s: str) -> int:
+    return int(any(ord(ch) in ZW_CODES for ch in s))
+
+def has_confusable_like(s: str) -> int:
+    has_latin = any('a' <= ch.lower() <= 'z' for ch in s)
+    has_greek = any(0x0370 <= ord(ch) <= 0x03FF or 0x1F00 <= ord(ch) <= 0x1FFF for ch in s)
+    has_cyril = any(0x0400 <= ord(ch) <= 0x04FF or 0x0500 <= ord(ch) <= 0x052F for ch in s)
+    arab_pres = any(0xFB50 <= ord(ch) <= 0xFEFF for ch in s)  # Arabic presentation forms
+    return int((has_latin and (has_greek or has_cyril)) or arab_pres)
+
+def compute_english_bands(df: pd.DataFrame, policy_path: str) -> pd.DataFrame:
+    import yaml, os
+    with open(policy_path, "r") as f:
+        pol = yaml.safe_load(f)
+    digits_th = pol.get("digits_threshold", 3)
+    len_th    = pol.get("length_threshold", 90)
+    out = df.copy()
+    url = out["text"].map(url_present)
+    dig = out["text"].map(lambda s: int(count_digits_all_scripts(s) >= digits_th))
+    lng = out["text"].map(lambda s: int(len(s) >= len_th))
+    score = url + dig + lng
+    band = score.map(lambda x: "low" if x == 0 else ("mid" if x == 1 else "high"))
+    out["ri_url"], out["ri_digits"], out["ri_len"] = url, dig, lng
+    out["ri_zw"], out["ri_conf"] = 0, 0
+    out["risk_score"], out["risk_band"] = score, band
+    return out
+
+def compute_arabic_bands(df: pd.DataFrame, policy_path: str) -> pd.DataFrame:
+    import yaml
+    with open(policy_path, "r") as f:
+        pol = yaml.safe_load(f)
+    digits_th = pol.get("digits_threshold", 3)
+    len_th    = pol.get("length_threshold", 90)
+    include_zw   = pol.get("arabic", {}).get("include_zero_width", True)
+    include_conf = pol.get("arabic", {}).get("include_confusable_like", True)
+    out = df.copy()
+    url  = out["text"].map(url_present)
+    dig  = out["text"].map(lambda s: int(count_digits_all_scripts(s) >= digits_th))
+    lng  = out["text"].map(lambda s: int(len(s) >= len_th))
+    zw   = out["text"].map(has_zero_width) if include_zw else 0
+    conf = out["text"].map(has_confusable_like) if include_conf else 0
+    if isinstance(zw, int):  # when disabled above
+        zw = pd.Series([zw] * len(out))
+        conf = pd.Series([conf] * len(out))
+    score = url + dig + lng + zw + conf
+    band = score.map(lambda x: "low" if x == 0 else ("mid" if x == 1 else "high"))
+    out["ri_url"], out["ri_digits"], out["ri_len"] = url, dig, lng
+    out["ri_zw"], out["ri_conf"] = zw, conf
+    out["risk_score"], out["risk_band"] = score, band
+    return out
+from typing import Tuple
+import numpy as np
+import pandas as pd
+from scipy.sparse import hstack
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+def build_and_split(df: pd.DataFrame, cfg: dict):
+    keep = df[["text", "y", "risk_band", "language"]].copy()
+    ss = cfg["split"]
+    train_df, rest_df = train_test_split(
+        keep, test_size=ss["test_size"], random_state=ss["random_state"], stratify=keep["y"]
+    )
+    cal_df, test_df = train_test_split(
+        rest_df, test_size=ss["cal_size"], random_state=ss["random_state"], stratify=rest_df["y"]
+    )
+
+    wmin, wmax = cfg["vectorizer"]["ngram_range"] if "ngram_range" in cfg["vectorizer"] else [1,2]
+    word_vec = TfidfVectorizer(
+        ngram_range=tuple(cfg["vectorizer"].get("word_ngram", [1,2])),
+        analyzer="word",
+        min_df=cfg["vectorizer"]["min_df"],
+        max_df=cfg["vectorizer"]["max_df"],
+        lowercase=True,
+        strip_accents="unicode",
+    )
+    char_vec = TfidfVectorizer(
+        ngram_range=tuple(cfg["vectorizer"].get("char_ngram", [3,5])),
+        analyzer="char",
+        min_df=cfg["vectorizer"]["min_df"],
+        lowercase=True,
+    )
+
+    X_tr = hstack([word_vec.fit_transform(train_df["text"]), char_vec.fit_transform(train_df["text"])])
+    X_cal = hstack([word_vec.transform(cal_df["text"]), char_vec.transform(cal_df["text"])])
+    X_te = hstack([word_vec.transform(test_df["text"]), char_vec.transform(test_df["text"])])
+
+    y_tr, y_cal, y_te = train_df["y"].values, cal_df["y"].values, test_df["y"].values
+    vecs = (word_vec, char_vec)
+    mats = (X_tr, y_tr, X_cal, y_cal, X_te, y_te)
+    splits = (train_df, cal_df, test_df)
+    return splits, vecs, mats
+from typing import Tuple
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+
+def train_with_temperature(mats, cfg: dict):
+    X_tr, y_tr, X_cal, y_cal, X_te, y_te = mats
+    lr = LogisticRegression(max_iter=cfg["model"]["get"]("max_iter", 2000), solver=cfg["model"]["get"]("lr_solver", "liblinear"))
+    # guard for dict "get" misuse:
+    try:
+        lr = LogisticRegression(max_iter=cfg["model"]["max_iter"], solver=cfg["model"]["lr_solver"])
+    except Exception:
+        pass
+    lr.fit(X_tr, y_tr)
+    cal = CalibratedClassifierCV(estimator=lr, method="sigmoid", cv="prefit")
+    cal.fit(X_cal, y_cal)
+    return {"base": lr, "cal": cal}
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support, brier_score_loss, roc_auc_score
+)
+
+def ece_score(y_true, p, n_bins=15) -> float:
+    bins = np.linspace(0.0, 1.0, n_bins+1)
+    idx = np.digitize(p, bins) - 1
+    N = len(y_true); score = 0.0
+    for b in range(n_bins):
+        m = (idx==b)
+        if m.sum()==0: 
+            continue
+        acc = np.mean(y_true[m]==1)
+        conf = np.mean(p[m])
+        score += (m.sum()/N)*abs(acc-conf)
+    return float(score)
+
+def classifier_report(y_true, p, thr=0.5):
+    yhat = (p>=thr).astype(int)
+    acc = accuracy_score(y_true, yhat)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, yhat, average="binary", zero_division=0)
+    brier = brier_score_loss(y_true, p)
+    auc = roc_auc_score(y_true, p)
+    return dict(accuracy=acc, precision=prec, recall=rec, f1=f1, brier=brier, auc=auc)
+import numpy as np
+from typing import Dict, Tuple
+
+def nonconformity_prob(p: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+    # true-label nonconformity: s = 1 - p(y|x)
+    return np.where(y_true==1, 1 - p, 1 - (1 - p))
+
+def tau_alpha(scores: np.ndarray, alpha: float) -> float:
+    n = len(scores)
+    k = int(np.ceil((1 - alpha) * (n + 1))) - 1
+    k = min(max(k, 0), n - 1)
+    return float(np.partition(scores, k)[k])
+
+def predict_set_size(p: np.ndarray, tau: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    s_pos = 1 - p
+    s_neg = 1 - (1 - p)
+    in_pos = s_pos <= tau
+    in_neg = s_neg <= tau
+    size = in_pos.astype(int) + in_neg.astype(int)
+    return in_pos, in_neg, size
+
+def evaluate_cp_global(p_cal, y_cal, p_te, y_te, alphas):
+    s_cal = nonconformity_prob(p_cal, y_cal)
+    coverage, ass, sing, abst = [], [], [], []
+    for a in alphas:
+        t = tau_alpha(s_cal, a)
+        in_pos, in_neg, size = predict_set_size(p_te, t)
+        covered = ((y_te==1) & in_pos) | ((y_te==0) & in_neg)
+        coverage.append(float(np.mean(covered)))
+        ass.append(float(np.mean(size)))
+        sing.append(float(np.mean(size==1)))
+        abst.append(float(np.mean(size==0)))
+    return coverage, ass, sing, abst
+
+def evaluate_cp_by_band(p_cal, y_cal, cal_band, p_te, y_te, te_band, alphas):
+    bands = ["low","mid","high"]
+    cov_by_band: Dict[str, list] = {}
+    for b in bands:
+        cal_mask = cal_band == b
+        te_mask  = te_band  == b
+        if cal_mask.sum()==0 or te_mask.sum()==0:
+            cov_by_band[b] = [np.nan]*len(alphas); continue
+        s_cal = nonconformity_prob(p_cal[cal_mask], y_cal[cal_mask])
+        band_cov = []
+        for a in alphas:
+            t = tau_alpha(s_cal, a)
+            in_pos, in_neg, size = predict_set_size(p_te[te_mask], t)
+            covered = ((y_te[te_mask]==1) & in_pos) | ((y_te[te_mask]==0) & in_neg)
+            band_cov.append(float(np.mean(covered)))
+        cov_by_band[b] = band_cov
+    return cov_by_band
+
+def evaluate_all(artifacts, cfg):
+    from .metrics import classifier_report, ece_score
+    from sklearn.calibration import CalibratedClassifierCV
+
+    dfe, dfa, (en_model, en_vecs), (ar_model, ar_vecs) = artifacts
+    en_cal: CalibratedClassifierCV = en_model["cal"]
+    ar_cal: CalibratedClassifierCV = ar_model["cal"]
+
+    # Prepare matrices again to compute metrics per split
+    # We *rebuild* splits as in vec.build_and_split to get y_true partition
+    from .vec import build_and_split
+    en_splits, _, en_mats = build_and_split(dfe, cfg)
+    ar_splits, _, ar_mats = build_and_split(dfa, cfg)
+    (en_train, en_cal_df, en_test) = en_splits
+    (ar_train, ar_cal_df, ar_test) = ar_splits
+    X_tr, y_tr, X_cal, y_cal, X_te, y_te = en_mats
+    X_tr_a, y_tr_a, X_cal_a, y_cal_a, X_te_a, y_te_a = ar_mats
+
+    # Probabilities
+    p_te_en = en_cal.predict_proba(X_te)[:,1]
+    p_te_ar = ar_cal.predict_proba(X_te_a)[:,1]
+    p_cal_en = en_cal.predict_proba(X_cal)[:,1]
+    p_cal_ar = ar_cal.predict_proba(X_cal_a)[:,1]
+
+    # Classifier metrics
+    en_cls = classifier_report(y_te, p_te_en)
+    ar_cls = classifier_report(y_te_a, p_te_ar)
+    en_cls["ece(15)"] = ece_score(y_te, p_te_en, n_bins=15)
+    ar_cls["ece(15)"] = ece_score(y_te_a, p_te_ar, n_bins=15)
+
+    # Global CP
+    alphas = np.array(cfg["cp"]["alphas"], dtype=float)
+    en_cov, en_ass, en_sing, en_abst = evaluate_cp_global(p_cal_en, y_cal, p_te_en, y_te, alphas)
+    ar_cov, ar_ass, ar_sing, ar_abst = evaluate_cp_global(p_cal_ar, y_cal_a, p_te_ar, y_te_a, alphas)
+
+    # Mondrian by risk band
+    en_cov_by_band = evaluate_cp_by_band(
+        p_cal_en, y_cal, en_cal_df["risk_band"].values,
+        p_te_en, y_te, en_test["risk_band"].values, alphas
+    )
+    ar_cov_by_band = evaluate_cp_by_band(
+        p_cal_ar, y_cal_a, ar_cal_df["risk_band"].values,
+        p_te_ar, y_te_a, ar_test["risk_band"].values, alphas
+    )
+
+    en_summary = {
+        "label": "EN",
+        "test_metrics_post_cal": {k: float(v) for k,v in en_cls.items()},
+        "cp_results": {
+            "alphas": alphas.tolist(),
+            "coverage": np.round(en_cov, 4).tolist(),
+            "avg_set_size": np.round(en_ass, 4).tolist(),
+            "singleton_rate": np.round(en_sing, 4).tolist(),
+            "abstention_rate": np.round(en_abst, 4).tolist(),
+            "coverage_by_risk_band": {k: np.round(np.array(v,dtype=float),4).tolist() for k,v in en_cov_by_band.items()},
+        }
+    }
+    ar_summary = {
+        "label": "AR",
+        "test_metrics_post_cal": {k: float(v) for k,v in ar_cls.items()},
+        "cp_results": {
+            "alphas": alphas.tolist(),
+            "coverage": np.round(ar_cov, 4).tolist(),
+            "avg_set_size": np.round(ar_ass, 4).tolist(),
+            "singleton_rate": np.round(ar_sing, 4).tolist(),
+            "abstention_rate": np.round(ar_abst, 4).tolist(),
+            "coverage_by_risk_band": {k: np.round(np.array(v,dtype=float),4).tolist() for k,v in ar_cov_by_band.items()},
+        }
+    }
+    return en_summary, ar_summary
+import numpy as np
+import matplotlib.pyplot as plt
+from .utils import path_join
+
+def plot_head2head(en_summary, ar_summary, cfg):
+    out = cfg["paths"]["processed_dir"]
+    alphas = np.array(en_summary["cp_results"]["alphas"])
+
+    # Coverage vs alpha
+    plt.figure(figsize=(6,4.2))
+    plt.plot(alphas, 1 - alphas, "--", lw=1, label="Target 1−α")
+    plt.plot(alphas, en_summary["cp_results"]["coverage"], "o-", label="EN")
+    plt.plot(alphas, ar_summary["cp_results"]["coverage"], "s-", label="AR")
+    plt.xlabel("α"); plt.ylabel("Coverage"); plt.title("Coverage vs α (EN vs AR)")
+    plt.ylim(0.75, 1.01); plt.grid(True, ls=":"); plt.legend()
+    plt.tight_layout(); plt.savefig(path_join(out, "fig_coverage_head2head.png"))
+
+    # ASS vs alpha
+    plt.figure(figsize=(6,4.2))
+    plt.plot(alphas, en_summary["cp_results"]["avg_set_size"], "o-", label="EN ASS")
+    plt.plot(alphas, ar_summary["cp_results"]["avg_set_size"], "s-", label="AR ASS")
+    plt.xlabel("α"); plt.ylabel("Average Set Size"); plt.title("ASS vs α (EN vs AR)")
+    plt.grid(True, ls=":"); plt.legend()
+    plt.tight_layout(); plt.savefig(path_join(out, "fig_ass_head2head.png"))
+
+    # Coverage by risk band
+    plt.figure(figsize=(7.2,4.6))
+    plt.plot(alphas, 1 - alphas, "--", lw=1, label="Target 1−α")
+    for band, marker in zip(["low","mid","high"], ["o","s","^"]):
+        en = en_summary["cp_results"]["coverage_by_risk_band"][band]
+        ar = ar_summary["cp_results"]["coverage_by_risk_band"][band]
+        plt.plot(alphas, en, marker+"-", label=f"EN {band}")
+        plt.plot(alphas, ar, marker+"--", label=f"AR {band}")
+    plt.xlabel("α"); plt.ylabel("Coverage"); plt.title("Coverage by Risk Band")
+    plt.ylim(0.75, 1.01); plt.legend(ncol=2); plt.grid(True, ls=":")
+    plt.tight_layout(); plt.savefig(path_join(out, "fig_coverage_by_band.png"))
+import argparse, yaml
+from src.tawkeed_cp import io, normalize, risk
+from src.tawkeed_cp.utils import set_seed
+
+def main(cfg):
+    set_seed(cfg["split"]["random_state"])
+    io.ensure_dirs(cfg)
+    dfe, dfa = io.load_raw(cfg)
+    dfe = normalize.apply_english(dfe)
+    dfa = normalize.apply_arabic(dfa)
+    policy_path = cfg["risk_policy"]
+    dfe = risk.compute_english_bands(dfe, policy_path)
+    dfa = risk.compute_arabic_bands(dfa, policy_path)
+    io.save_interim(dfe, dfa, cfg)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+    cfg = yaml.safe_load(open(args.config))
+    main(cfg)
+import argparse, yaml
+from src.tawkeed_cp import io, vec, models
+from src.tawkeed_cp.utils import set_seed
+
+def main(cfg):
+    set_seed(cfg["split"]["random_state"])
+    dfe, dfa = io.load_interim(cfg)
+    en_splits, en_vecs, en_mats = vec.build_and_split(dfe, cfg)
+    ar_splits, ar_vecs, ar_mats = vec.build_and_split(dfa, cfg)
+    en_model = models.train_with_temperature(en_mats, cfg)
+    ar_model = models.train_with_temperature(ar_mats, cfg)
+    io.save_models((en_model, en_vecs), (ar_model, ar_vecs), cfg)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+    cfg = yaml.safe_load(open(args.config))
+    main(cfg)
+import argparse, yaml
+from src.tawkeed_cp import io, cp
+from src.tawkeed_cp.utils import set_seed
+
+def main(cfg):
+    set_seed(cfg["split"]["random_state"])
+    artifacts = io.load_models_and_data(cfg)
+    en_summary, ar_summary = cp.evaluate_all(artifacts, cfg)
+    io.save_summaries(en_summary, ar_summary, cfg)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+    cfg = yaml.safe_load(open(args.config))
+    main(cfg)
+import yaml
+from src.tawkeed_cp import io, plots
+
+def main(cfg):
+    en_sum, ar_sum = io.load_summaries(cfg)
+    plots.plot_head2head(en_sum, ar_sum, cfg)
+
+if __name__ == "__main__":
+    cfg = yaml.safe_load(open("configs/default.yaml"))
+    main(cfg)
+import yaml, os
+from src.tawkeed_cp import io
+from src.tawkeed_cp.utils import write_markdown, path_join
+
+def extract_at_alpha(summary, a=0.10):
+    alphas = summary["cp_results"]["alphas"]
+    i = alphas.index(a)
+    return {
+        "coverage": summary["cp_results"]["coverage"][i],
+        "avg_set_size": summary["cp_results"]["avg_set_size"][i],
+        "singleton_rate": summary["cp_results"]["singleton_rate"][i],
+        "abstention_rate": summary["cp_results"]["abstention_rate"][i],
+    }
+
+def main(cfg):
+    out = cfg["paths"]["processed_dir"]
+    en, ar = io.load_summaries(cfg)
+    en05 = extract_at_alpha(en, 0.05)
+    ar05 = extract_at_alpha(ar, 0.05)
+    en10 = extract_at_alpha(en, 0.10)
+    ar10 = extract_at_alpha(ar, 0.10)
+
+    text = f"""# 4. Implementation and Experiments (Auto-generated)
+
+**Classifier (post-calibration)**  
+EN: {en['test_metrics_post_cal']}  
+AR: {ar['test_metrics_post_cal']}
+
+**Conformal (overall)**  
+α=0.05 → EN {en05} | AR {ar05}  
+α=0.10 → EN {en10} | AR {ar10}
+
+**Coverage by risk band (arrays over the α grid)**  
+EN: {en['cp_results']['coverage_by_risk_band']}  
+AR: {ar['cp_results']['coverage_by_risk_band']}
+"""
+    write_markdown(path_join(out, "section4_generated.md"), text)
+
+if __name__ == "__main__":
+    cfg = yaml.safe_load(open("configs/default.yaml"))
+    main(cfg)
