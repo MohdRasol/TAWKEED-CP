@@ -1,0 +1,18 @@
+import argparse, yaml, os
+from src.tawkeed_cp import io, normalize, risk
+
+def main(cfg):
+    io.ensure_dirs(cfg)
+    dfe, dfa = io.load_raw(cfg)
+    dfe = normalize.apply_english(dfe)
+    dfa = normalize.apply_arabic(dfa)
+    dfe = risk.compute_english_bands(dfe, cfg["risk_policy"])
+    dfa = risk.compute_arabic_bands(dfa, cfg["risk_policy"])
+    io.save_interim(dfe, dfa, cfg)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+    cfg = yaml.safe_load(open(args.config))
+    main(cfg)
