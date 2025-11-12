@@ -10,3 +10,18 @@ python scripts/eval_cp.py --config configs/default.yaml
 # Generate plots and Section 4 text
 python scripts/plot_results.py
 python scripts/export_section4.py
+🔬 Method summary
+
+Normalization ([T3]/[I2]): Arabic diacritics removal, alif/yāʾ canonicalization, clitic segmentation; English lemmatization; Unicode safety checks.
+
+Risk vector 
+𝑅(𝑥)
+R(x) ([T2]/[I2]): URL presence, digit count (Latin + Arabic-Indic), long message length; Arabic only: zero-width controls, confusables.
+
+Vectorizers ([T4]): TF-IDF word 1–2 + char 3–5; strong baseline for SMS.
+
+Baseline & temperature ([T5–T6]): LR + per-language temperature (Platt) for calibrated probabilities.
+
+Conformal Prediction ([T7]/[I6]): split CP; Mondrian per cell 
+𝑚=(𝑙𝑎𝑛𝑔𝑢𝑎𝑔𝑒,𝑟𝑖𝑠𝑘)m=(language,risk); coverage vs. 
+α, ASS, Singleton/Abstention, per-band audits.
